@@ -1,30 +1,34 @@
 """
-Demo Loyalty Bot — універсальний приклад бота програми лояльності для кав'ярень.
+Demo Loyalty Bot v2 — з Telegram Mini App (WebApp) для "вау-ефекту".
 
-Не прив'язаний до жодного конкретного бренду — показуй будь-якому закладу
-як приклад того, що можна зробити. Назва/тексти легко міняються під
-конкретного клієнта пізніше.
-
-Клієнт: /start -> ділиться номером телефону (кнопка, підтверджує сам Telegram,
-        SMS не потрібні) -> бачить баланс і історію нарахувань.
-Адмін:  окремі команди/кнопки, доступні тільки user_id з списку ADMIN_IDS ->
-        пошук клієнта за номером (повним або останніми 4 цифрами),
-        нарахування/списання балів, розсилка новин.
+Окрім звичних текстових команд, бот відкриває справжню візуальну картку
+лояльності прямо всередині Telegram: анімований прогрес-бар, список
+нагород, історія — все як у нормальному застосунку, без переходу на
+сторонній сайт.
 
 Запуск:
     pip install -r requirements.txt
     export BOT_TOKEN="твій_токен_від_BotFather"
     export ADMIN_IDS="123456789,987654321"
+    export PUBLIC_URL="https://твій-домен-на-railway.up.railway.app"
     python bot.py
+
+ВАЖЛИВО: Telegram WebApp вимагає HTTPS-адресу. Локально (http://localhost)
+кнопка з міні-аппом не відкриється — тестувати міні-апп можна тільки
+після деплою на Railway (там HTTPS видається автоматично).
 """
 
 import asyncio
+import hashlib
+import hmac
+import json
 import logging
 import os
 import re
 import sqlite3
 from contextlib import closing
 from datetime import datetime
+from urllib.parse import parse_qsl
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -38,16 +42,20 @@ from aiogram.types import (
     BotCommandScopeChat,
     BotCommandScopeDefault,
     Contact,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
+    WebAppInfo,
 )
+from aiohttp import web
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("demo_loyalty_bot")
 
 # ---------------------------------------------------------------------------
-# Конфігурація — все, що варто міняти під конкретне кафе, зібрано тут
+# Конфігурація
 # ---------------------------------------------------------------------------
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -55,11 +63,17 @@ ADMIN_IDS = {
     int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()
 }
 DB_PATH = os.environ.get("DB_PATH", "demo_loyalty.db")
-
 CAFE_NAME = os.environ.get("CAFE_NAME", "Demo Coffee")
-MENU_URL = os.environ.get("MENU_URL", "")  # можна лишити пустим для демо
+# Публічний HTTPS-домен цього ж сервісу на Railway — потрібен, щоб зібрати
+# посилання на міні-апп. Railway підставляє його сам у RAILWAY_PUBLIC_DOMAIN,
+# або встанови вручну через PUBLIC_URL.
+PUBLIC_URL = os.environ.get("PUBLIC_URL") or (
+    f"https://{os.environ['RAILWAY_PUBLIC_DOMAIN']}"
+    if os.environ.get("RAILWAY_PUBLIC_DOMAIN")
+    else ""
+)
+PORT = int(os.environ.get("PORT", "8080"))
 
-# Приклад тарифів — легко змінити під реальні напої клієнта
 REWARDS = [
     {"name": "Маленька кава", "cost": 80},
     {"name": "Велика кава + десерт", "cost": 150},
@@ -233,15 +247,20 @@ def is_admin(telegram_id: int) -> bool:
     return telegram_id in ADMIN_IDS
 
 
+def webapp_url() -> str:
+    return f"{PUBLIC_URL}/webapp" if PUBLIC_URL else ""
+
+
 CLIENT_COMMANDS = [
     BotCommand(command="start", description="Почати / мій кабінет"),
+    BotCommand(command="card", description="Відкрити картку лояльності"),
     BotCommand(command="balance", description="Мій баланс балів"),
     BotCommand(command="history", description="Історія нарахувань"),
 ]
 
 ADMIN_COMMANDS = CLIENT_COMMANDS + [
     BotCommand(command="admin", description="Панель персоналу"),
-    BotCommand(command="find", description="Знайти клієнта (номер або останні 4 цифри)"),
+    BotCommand(command="find", description="Знайти клієнта"),
     BotCommand(command="list", description="Список усіх клієнтів"),
     BotCommand(command="broadcast", description="Розіслати новину всім клієнтам"),
     BotCommand(command="add", description="Нарахувати бали"),
@@ -287,6 +306,17 @@ ADMIN_KB = ReplyKeyboardMarkup(
 )
 
 
+def card_inline_kb() -> InlineKeyboardMarkup | None:
+    url = webapp_url()
+    if not url:
+        return None
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🎴 Відкрити картку лояльності", web_app=WebAppInfo(url=url))]
+        ]
+    )
+
+
 # ---------------------------------------------------------------------------
 # Роутери
 # ---------------------------------------------------------------------------
@@ -304,11 +334,14 @@ class AdminStates(StatesGroup):
 async def cmd_start(message: Message):
     user = get_user_by_id(message.from_user.id)
     if user:
+        kb = card_inline_kb()
         await message.answer(
             f"З поверненням, {user['name']}! 👋\n\n"
             f"Твій баланс: <b>{user['balance']}</b> балів\n\n{rewards_text(user['balance'])}",
             reply_markup=CLIENT_KB,
         )
+        if kb:
+            await message.answer("Або поглянь на свою картку лояльності 👇", reply_markup=kb)
         return
     await message.answer(
         f"Привіт! Це демо-бот програми лояльності <b>{CAFE_NAME}</b> ☕\n\n"
@@ -333,6 +366,24 @@ async def on_contact(message: Message):
         "Обери дію на клавіатурі нижче 👇",
         reply_markup=CLIENT_KB,
     )
+    kb = card_inline_kb()
+    if kb:
+        await message.answer("Ось твоя нова картка лояльності 🎴", reply_markup=kb)
+
+
+@client_router.message(Command("card"))
+async def cmd_card(message: Message):
+    user = get_user_by_id(message.from_user.id)
+    if not user:
+        await message.answer("Спершу поділись номером телефону: /start")
+        return
+    kb = card_inline_kb()
+    if not kb:
+        # PUBLIC_URL ще не налаштовано (наприклад, локальний запуск) —
+        # відкриваємо звичайний текстовий баланс замість міні-аппу.
+        await cmd_balance(message)
+        return
+    await message.answer("Твоя картка лояльності 🎴", reply_markup=kb)
 
 
 @client_router.message(Command("balance"))
@@ -575,6 +626,82 @@ async def btn_search_run(message: Message, state: FSMContext):
 
 
 # ---------------------------------------------------------------------------
+# Веб-сервер для Telegram Mini App
+# ---------------------------------------------------------------------------
+
+def validate_init_data(init_data: str) -> dict | None:
+    """Перевіряє підпис даних, які Telegram передає міні-аппу (щоб ніхто
+    сторонній не міг підсунути чужий telegram_id і побачити чужий баланс).
+    Офіційний алгоритм перевірки з документації Telegram WebApp."""
+    if not init_data or not BOT_TOKEN:
+        return None
+    try:
+        parsed = dict(parse_qsl(init_data, strict_parsing=True))
+    except ValueError:
+        return None
+    received_hash = parsed.pop("hash", None)
+    if not received_hash:
+        return None
+    data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed.items()))
+    secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+    computed_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(computed_hash, received_hash):
+        return None
+    user_raw = parsed.get("user")
+    if not user_raw:
+        return None
+    try:
+        return json.loads(user_raw)
+    except json.JSONDecodeError:
+        return None
+
+
+async def handle_index(request: web.Request) -> web.Response:
+    path = os.path.join(os.path.dirname(__file__), "static", "index.html")
+    with open(path, encoding="utf-8") as f:
+        return web.Response(text=f.read(), content_type="text/html")
+
+
+async def handle_api_me(request: web.Request) -> web.Response:
+    init_data = request.query.get("initData", "")
+    tg_user = validate_init_data(init_data)
+    if not tg_user:
+        return web.json_response({"error": "invalid initData"}, status=401)
+
+    telegram_id = tg_user.get("id")
+    user = get_user_by_id(telegram_id)
+    if not user:
+        return web.json_response({"error": "user not found"}, status=404)
+
+    history = get_history(telegram_id, limit=10)
+    history_out = [
+        {
+            "amount": h["amount"],
+            "note": h["note"],
+            "date": h["created_at"][:16].replace("T", " "),
+        }
+        for h in history
+    ]
+
+    return web.json_response(
+        {
+            "name": user["name"],
+            "balance": user["balance"],
+            "rewards": REWARDS,
+            "history": history_out,
+            "just_unlocked": False,
+        }
+    )
+
+
+def create_web_app() -> web.Application:
+    app = web.Application()
+    app.router.add_get("/webapp", handle_index)
+    app.router.add_get("/api/me", handle_api_me)
+    return app
+
+
+# ---------------------------------------------------------------------------
 # Точка входу
 # ---------------------------------------------------------------------------
 
@@ -582,11 +709,27 @@ async def main():
     if not BOT_TOKEN:
         raise SystemExit("Задай змінну середовища BOT_TOKEN (токен від @BotFather)")
     db_init()
+
+    if not PUBLIC_URL:
+        log.warning(
+            "PUBLIC_URL не задано — кнопка міні-аппу буде прихована, "
+            "клієнти бачитимуть лише текстовий баланс. Задай PUBLIC_URL "
+            "після деплою на Railway (публічний https-домен сервісу)."
+        )
+
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(admin_router)
     dp.include_router(client_router)
     await setup_commands(bot)
+
+    web_app = create_web_app()
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    log.info("Веб-сервер міні-аппу запущено на порту %s", PORT)
+
     log.info("Бот запущено. Адміни: %s", ADMIN_IDS or "не задані!")
     await dp.start_polling(bot)
 
